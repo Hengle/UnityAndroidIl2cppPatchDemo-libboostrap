@@ -9,14 +9,8 @@
 #include "zip/shadow_zip.h"
 #include "xhook/xhook.h"
 #include "io_github_noodle1983_Boostrap.h"
-
-struct GlobalData
-{	
-	std::map<int, FILE*> g_fd_to_file;	
-	std::map<FILE*, ShadowZip*> g_file_to_shadowzip;
-	PthreadRwMutex g_file_to_shadowzip_mutex;
-};
-#define g_global_data (LeakSingleton<GlobalData, 0>::instance())
+#include "mymap32.h"
+#include "file_mapping.h"
 
 
 static inline char * dupstr(const char* const str)
@@ -45,8 +39,7 @@ JNIEXPORT void JNICALL Java_io_github_noodle1983_Boostrap_init
 	jenv->ReleaseStringUTFChars(path, data_file_path);
 	MY_INFO("data file path:%s", g_data_file_path);
 	
-	LeakSingleton<GlobalData, 0>::init();
-    bootstrap();
+	bootstrap();
 }
 
 static std::string get_bundle_id()
@@ -75,7 +68,7 @@ char* get_arch_abi()
 	return dupstr(TARGET_ARCH_ABI);
 }
 
-static char* g_use_data_path = NULL;
+char* g_use_data_path = NULL;
 __attribute__ ((visibility ("default")))
 char* use_data_dir(const char* data_path, const char* apk_path)
 {
@@ -304,108 +297,6 @@ static bool extract_patch_info(const std::string& bundle_id, std::string& defaul
 	return true;
 }
 
-#include <elfio/elfio.hpp> 
-using namespace ELFIO;
-static void elf_hook(char const *so_file, void const* so_map_addr, std::vector<const char*>& symbol_names, std::vector<void const *>& new_func, std::vector<void **> & old_func)
-{
-    static size_t pagesize = sysconf(_SC_PAGESIZE);
-	
-    elfio reader;
-	if (!reader.load(so_file)) {        
-		MY_ERROR("can't access path:%s", so_file);;
-		return;
-	}
-	
-	size_t bias_addr = -1;
-	const section* dynsym = NULL;
-	const section* relplt = NULL;
-	Elf_Half sec_num = reader.sections.size(); 
-	for ( int i = 0; i < sec_num; ++i ) {
-		const section* psec = reader.sections[i]; 
-		if(bias_addr == -1 && (psec->get_type() & PT_LOAD)){
-			bias_addr = (size_t)so_map_addr + psec->get_offset() - psec->get_address();
-			MY_LOG("fix addr 0x%zx ->0x%zx", (size_t)so_map_addr, bias_addr);
-		}
-		
-		if (strcmp(psec->get_name().c_str(), ".dynsym") == 0){dynsym = psec;}
-		else if (strcmp(psec->get_name().c_str(), ".rel.plt") == 0){relplt = psec;}
-		else if (strcmp(psec->get_name().c_str(), ".rela.plt") == 0){relplt = psec;}
-		
-		if (dynsym != NULL && relplt != NULL){break;}
-	}
-	if (bias_addr == -1){
-		bias_addr = (size_t)so_map_addr;
-		MY_LOG("force addr 0x%zx ->0x%zx", (size_t)so_map_addr, bias_addr);
-	}
-	
-	if (dynsym == NULL && relplt == NULL) {    
-		MY_ERROR("can't get section, dynsym:0x%zx, relplt:0x%zx", (size_t)dynsym, (size_t)relplt);;
-		return;		
-	}
-	
-	std::map<const char*, size_t> name2index;
-	const_symbol_section_accessor dynamic_symbols( reader, dynsym );
-	for ( unsigned int j = 0; j < dynamic_symbols.get_symbols_num(); ++j ) { 
-		std::string   name;
-		Elf64_Addr    value   = 0;
-		Elf_Xword     size    = 0;
-		unsigned char bind    = 0;
-		unsigned char type    = 0;
-		Elf_Half      section = 0;
-		unsigned char other   = 0;
-        dynamic_symbols.get_symbol( j, name, value, size, bind, type, section, other );
-        for(int i = 0; i < symbol_names.size(); i++)
-		{
-			const char* find_name = symbol_names[i];
-			if (strcmp(find_name, name.c_str()) == 0){
-				name2index[find_name] = j;
-				MY_LOG("found %s:%d", name.c_str(), j);
-				if (name2index.size() == symbol_names.size()) {break;}
-			}
-		}
-		if (name2index.size() == symbol_names.size()) {break;}	
-    }
-	
-	if (name2index.size() != symbol_names.size()) {
-		MY_ERROR("name2index not completed");
-		return;
-	}	
-	
-	const_relocation_section_accessor rel_entries( reader, relplt );
-	for(int j = 0; j < rel_entries.get_entries_num(); j++)
-	{
-		Elf64_Addr offset;
-		Elf_Word   symbol;
-		Elf_Word   type;
-		Elf_Sxword addend;
-		bool ret = rel_entries.get_entry( j, offset, symbol, type, addend );
-		if (!ret){
-			MY_ERROR("can't get sym offset, dynsym:%d", j);
-			return;
-		}
-		
-		//MY_LOG("rel %d:[0x%zx][%d][%d][%d]", j, (size_t)offset, symbol, type, (size_t)addend);
-		std::map<const char*, size_t>::iterator it = name2index.begin();
-		for(int i = 0; it != name2index.end(); it++, i++)
-		{
-			
-			int index = it->second;
-			if (index == symbol)
-			{
-				size_t* ori_func_addr = (size_t *)(((size_t)bias_addr) + offset);
-				void* original = (void *)*ori_func_addr;
-				MY_LOG("%s:(0x%zx + 0x%zx) = 0x%zx, old:0x%zx -> new:0x%zx", it->first, (size_t)bias_addr, (size_t)offset, (size_t)ori_func_addr, 
-					(size_t)original, (size_t)new_func[i]);
-				*old_func[i] = original;
-				//if (bias_addr == (size_t)so_map_addr)
-				{
-					*ori_func_addr = (size_t)new_func[i];
-				}				
-			}
-		}
-	}
-}
-
 static void* get_module_base( const char* module_name )
 {
 	FILE *fp;
@@ -508,22 +399,11 @@ std::string get_apk_path(const std::string& bundle_id)
 	return ret;
 }
 
-static void check_set_old_function_to_shadow_zip();
-
 typedef int (* StatType)(const char *path, struct stat *file_stat);
-static StatType old_stat = NULL;
 static int my_stat(const char *path, struct stat *file_stat)
-{
-	if (old_stat == NULL)
-	{
-		MY_ERROR("old_stat is NULL");
-		return -1;
-	}
-	
-	check_set_old_function_to_shadow_zip();
-	
+{	
 	memset(file_stat, 0, sizeof(struct stat));
-	int ret = old_stat(path, file_stat);
+	int ret = stat(path, file_stat);
 	if (ret != 0) {
 		return ret;
 	}
@@ -542,42 +422,27 @@ static int my_stat(const char *path, struct stat *file_stat)
 
 static ShadowZip* get_cached_shadowzip(FILE *stream)
 {
-	PthreadReadGuard(g_global_data->g_file_to_shadowzip_mutex);
-	std::map<FILE*, ShadowZip*>::iterator it = g_global_data->g_file_to_shadowzip.find(stream);
-	ShadowZip* shadow_zip = (it == g_global_data->g_file_to_shadowzip.end()) ? NULL : it->second;
-	return shadow_zip;
+	FileExtraData* file_extra_data = get_file_mapping(stream);
+	return file_extra_data == NULL ? NULL : file_extra_data->shadow_zip;
 }
 
 static ShadowZip* get_cached_shadowzip(int fd)
 {
-	PthreadReadGuard(g_global_data->g_file_to_shadowzip_mutex);
-	std::map<int, FILE*>::iterator it_fd = g_global_data->g_fd_to_file.find(fd);
-	FILE* stream = (it_fd == g_global_data->g_fd_to_file.end()) ? NULL : it_fd->second;
-	if (stream == NULL){return NULL;}
-	std::map<FILE*, ShadowZip*>::iterator it = g_global_data->g_file_to_shadowzip.find(stream);
-	ShadowZip* shadow_zip = (it == g_global_data->g_file_to_shadowzip.end()) ? NULL : it->second;
-	return shadow_zip;
+	FileExtraData* file_extra_data = get_file_mapping(fd);
+	return file_extra_data == NULL ? NULL : file_extra_data->shadow_zip;
 }
 
 typedef FILE *(* FOpenType)(const char *path, const char *mode);
-static FOpenType old_fopen = NULL;
 static FILE *my_fopen(const char *path, const char *mode)
 {	
-	MY_METHOD("fopen([%s],[%s]) old:%zx :%zx", path, mode, (size_t)old_fopen, (size_t)(ShadowZip::old_fopen));
-	if (old_fopen == NULL)
-	{
-		MY_ERROR("fopen is NULL");
-		return old_fopen(path, mode);
-	}
-	
-	check_set_old_function_to_shadow_zip();
+	MY_METHOD("fopen([%s],[%s])", path, mode);
 	
 	struct stat file_stat;
 	memset(&file_stat, 0, sizeof(struct stat));
-	if (old_stat(path, &file_stat) != 0) {
+	if (stat(path, &file_stat) != 0) {
 		
 		MY_METHOD("not exist([%s],[%s])", path, mode);
-		return old_fopen(path, mode);
+		return fopen(path, mode);
 	}
 	
 	if (g_apk_device_id == file_stat.st_dev && g_apk_ino == file_stat.st_ino)
@@ -587,125 +452,99 @@ static FILE *my_fopen(const char *path, const char *mode)
 		if (fp == NULL){	
 			MY_ERROR("something bad happens!");
 			delete shadow_zip;
-			return old_fopen(path, mode); 
+			return fopen(path, mode); 
 		}	
 		
-		MY_LOG("shadow apk: %s", path);
-		PthreadWriteGuard(g_global_data->g_file_to_shadowzip_mutex);
-		g_global_data->g_file_to_shadowzip[fp] = shadow_zip;
-		return fp;
+		FileExtraData* file_extra_data = save_file_mapping(shadow_zip);
+		MY_LOG("shadow apk in fopen: %s, fd:0x%08x, file*: 0x%08llx", path, file_extra_data->fd, (unsigned long long)file_extra_data->file);	
+		return file_extra_data->file;
 	}
 	
 	MY_METHOD("not apk([%s],[%s])", path, mode);
-	return old_fopen(path, mode);
+	return fopen(path, mode);
 }
 
 
 typedef int (*FseekType)(FILE *stream, long offset, int whence);
-static FseekType old_fseek = NULL;
 static int my_fseek(FILE *stream, long offset, int whence)
 {
 	
-	check_set_old_function_to_shadow_zip();
-	
 	ShadowZip* shadow_zip = get_cached_shadowzip(stream);
 	if (shadow_zip == NULL){
-		return old_fseek(stream, offset, whence);
+		return fseek(stream, offset, whence);
 	}else{
 		return shadow_zip->fseek(stream, offset, whence);
 	}
 }
 
 typedef long (*FtellType)(FILE *stream);
-static FtellType old_ftell = NULL;
 static int my_ftell(FILE *stream)
 {
 	
-	check_set_old_function_to_shadow_zip();
-	
 	ShadowZip* shadow_zip = get_cached_shadowzip(stream);
 	if (shadow_zip == NULL){
-		return old_ftell(stream);
+		return ftell(stream);
 	}else{
 		return shadow_zip->ftell(stream);
 	}
 }
 
 typedef void (*RewindType)(FILE *stream);
-static RewindType old_rewind = NULL;
 static void myrewind(FILE *stream)
 {
 	
-	check_set_old_function_to_shadow_zip();
-	
 	ShadowZip* shadow_zip = get_cached_shadowzip(stream);
 	if (shadow_zip == NULL){
-		old_rewind(stream);
+		rewind(stream);
 	}else{
 		shadow_zip->rewind(stream);
 	}
 }
 
 typedef size_t (*FreadType)(void *ptr, size_t size, size_t nmemb, FILE *stream);
-static FreadType old_fread = NULL;
 static size_t my_fread(void *ptr, size_t size, size_t nmemb, FILE *stream)
 {
 	
-	check_set_old_function_to_shadow_zip();
-	
 	ShadowZip* shadow_zip = get_cached_shadowzip(stream);
 	if (shadow_zip == NULL){
-		return old_fread(ptr, size, nmemb, stream);
+		return fread(ptr, size, nmemb, stream);
 	}else{
 		return shadow_zip->fread(ptr, size, nmemb, stream);
 	}
 }
 
 typedef char * (*Fgets)(char *s, int size, FILE *stream);
-static Fgets old_fgets = NULL;
 static char * my_fgets(char *s, int size, FILE *stream)
 {
 	
-	check_set_old_function_to_shadow_zip();
-	
 	ShadowZip* shadow_zip = get_cached_shadowzip(stream);
 	if (shadow_zip == NULL){
-		return old_fgets(s, size, stream);
+		return fgets(s, size, stream);
 	}else{
 		return shadow_zip->fgets(s, size, stream);
 	}
 }
 
 typedef int (*FcloseType)(FILE* _fp);
-static FcloseType old_fclose = NULL;
 static int my_fclose(FILE* stream)
 {
+	MY_METHOD("my_fclose: file*: 0x%08llx", (unsigned long long)stream);
 	
-	check_set_old_function_to_shadow_zip();
-	
-	ShadowZip* shadow_zip = NULL;
+	FileExtraData* file_extra_data = get_file_mapping(stream);
+	if (file_extra_data != NULL)
 	{
-		PthreadWriteGuard(g_global_data->g_file_to_shadowzip_mutex);
-		std::map<FILE*, ShadowZip*>::iterator it = g_global_data->g_file_to_shadowzip.find(stream);
-		shadow_zip = (it == g_global_data->g_file_to_shadowzip.end()) ? NULL : it->second;
-		if (it != g_global_data->g_file_to_shadowzip.end()){
-			g_global_data->g_file_to_shadowzip.erase(it);
-		}	
+		clean_mapping_data(file_extra_data);
+		return 0;
 	}
-	
-	if (shadow_zip == NULL){
-		return old_fclose(stream);
-	}else{
-		return shadow_zip->fclose(stream);
+	else
+	{
+		return fclose(stream);		
 	}
 }
 
 typedef void *(*DlopenType)(const char *filename, int flags);
-static DlopenType old_dlopen = NULL;
 static void *my_dlopen(const char *filename, int flags)
 {
-	
-	check_set_old_function_to_shadow_zip();
 	
 	int il2cpp_postfix_len = strlen("libil2cpp.so");
 	int len = strlen(filename);
@@ -715,23 +554,14 @@ static void *my_dlopen(const char *filename, int flags)
 		char link_file[256] = {0};
 		snprintf(link_file, sizeof(link_file), "%s/libil2cpp.so", g_data_file_path);
 		MY_LOG("redirect to %s", link_file);
-		return old_dlopen(link_file, flags);
+		return dlopen(link_file, flags);
 	}
-	return old_dlopen(filename, flags);
+	return dlopen(filename, flags);
 }
 
 typedef int (*OpenType)(const char *path, int flags, ...);
-static OpenType old_open = NULL;
 static int my_open(const char *path, int flags, ...)
-{	
-	if (old_open == NULL)
-	{
-		MY_ERROR("open is NULL");
-		return -1;
-	}
-		
-	check_set_old_function_to_shadow_zip();
-	
+{		
 	mode_t mode = -1;
 	int has_mode = ((flags & O_CREAT) == O_CREAT) || ((flags & 020000000) == 020000000);
 	if (has_mode)
@@ -744,9 +574,9 @@ static int my_open(const char *path, int flags, ...)
 	
 	struct stat file_stat;
 	memset(&file_stat, 0, sizeof(struct stat));
-	if (old_stat(path, &file_stat) != 0) {
-		int ret = has_mode ? old_open(path, flags, mode) : old_open(path, flags);
-		MY_METHOD("open: %s -> fd:0x%08x", path, ret);
+	if (stat(path, &file_stat) != 0) {
+		int ret = has_mode ? open(path, flags, mode) : open(path, flags);
+		MY_METHOD("open(can't access): %s -> fd:0x%08x", path, ret);
 		return ret;
 	}
 	
@@ -757,36 +587,31 @@ static int my_open(const char *path, int flags, ...)
 		if (fp == NULL){	
 			MY_ERROR("something bad happens!");
 			delete shadow_zip;
-			int ret = has_mode ? old_open(path, flags, mode) : old_open(path, flags);
-			MY_METHOD("open: %s -> fd:0x%08x", path, ret);
+			int ret = has_mode ? open(path, flags, mode) : open(path, flags);
+			MY_METHOD("open(rollback): %s -> fd:0x%08x", path, ret);
 			return ret;
 		}	
-		int fd = fileno(fp);
 		
-		MY_LOG("shadow apk: %s, fd:0x%08x,", path, fd);
-		PthreadWriteGuard(g_global_data->g_file_to_shadowzip_mutex);
-		g_global_data->g_fd_to_file[fd] = fp;
-		g_global_data->g_file_to_shadowzip[fp] = shadow_zip;
-		return fd;
+		FileExtraData* file_extra_data = save_file_mapping(shadow_zip);
+		MY_LOG("shadow apk in open: %s, fd:0x%08x, file*: 0x%08llx", path, file_extra_data->fd, (unsigned long long)file_extra_data->file);	
+		return file_extra_data->fd;
 	}
 	
-	int ret = has_mode ? old_open(path, flags, mode) : old_open(path, flags);
-	MY_METHOD("open: %s -> fd:0x%08x", path, ret);
+	int ret = has_mode ? open(path, flags, mode) : open(path, flags);
+	MY_METHOD("not apk open: %s -> fd:0x%08x", path, ret);
 	return ret;
 }
 
 typedef ssize_t(*ReadType)(int fd, void *buf, size_t nbyte);
-static ReadType old_read = NULL;
 static ssize_t my_read(int fd, void *buf, size_t nbyte)
 {
 	MY_METHOD("read: 0x%08x, %zu", fd, nbyte);
 	
-	check_set_old_function_to_shadow_zip();
 	
 	ssize_t ret = 0;
 	ShadowZip* shadow_zip = get_cached_shadowzip(fd);
 	if (shadow_zip == NULL){
-		ret = old_read(fd, buf, nbyte);
+		ret = read(fd, buf, nbyte);
 	}else{
 		ret = shadow_zip->fread(buf, 1, nbyte, (FILE*)(size_t)fd);
 	}
@@ -795,17 +620,14 @@ static ssize_t my_read(int fd, void *buf, size_t nbyte)
 }
 
 typedef off_t (*LseekType)(int fd, off_t offset, int whence);
-static LseekType old_lseek = NULL;
 off_t my_lseek(int fd, off_t offset, int whence)
 {
 	MY_METHOD("lseek: 0x%08x, offset: 0x%08lx, whence: %d", fd, offset, whence);
-	
-	check_set_old_function_to_shadow_zip();
-	
+		
 	off_t ret = 0;
 	ShadowZip* shadow_zip = get_cached_shadowzip(fd);
 	if (shadow_zip == NULL){
-		ret = old_lseek(fd, offset, whence);
+		ret = lseek(fd, offset, whence);
 	}else{
 		ret = shadow_zip->fseek((FILE*)(size_t)fd, offset, whence);
 		if (ret == 0){ret = shadow_zip->ftell((FILE*)(size_t)fd);}
@@ -815,17 +637,14 @@ off_t my_lseek(int fd, off_t offset, int whence)
 }
 
 typedef off64_t (*Lseek64Type)(int fd, off64_t offset, int whence);
-static Lseek64Type old_lseek64 = NULL;
 off64_t my_lseek64(int fd, off64_t offset, int whence)
 {
 	MY_METHOD("lseek64: 0x%08x, offset: 0x%08llx, whence: %d", fd, (unsigned long long)offset, whence);
 	
-	check_set_old_function_to_shadow_zip();
-	
 	off64_t ret = 0;
 	ShadowZip* shadow_zip = get_cached_shadowzip(fd);
 	if (shadow_zip == NULL){
-		ret =  old_lseek64(fd, offset, whence);
+		ret =  lseek64(fd, offset, whence);
 	}else{
 		ret =  shadow_zip->fseek((FILE*)(size_t)fd, offset, whence);
 		if (ret == 0){ret = shadow_zip->ftell((FILE*)(size_t)fd);}
@@ -835,32 +654,19 @@ off64_t my_lseek64(int fd, off64_t offset, int whence)
 }
 
 typedef int (*CloseType)(int fd);
-static CloseType old_close = NULL;
 static int my_close(int fd)
 {
 	MY_METHOD("my_close: 0x%08x", fd);
 	
-	check_set_old_function_to_shadow_zip();
-	
-	ShadowZip* shadow_zip = NULL;
+	FileExtraData* file_extra_data = get_file_mapping(fd);
+	if (file_extra_data != NULL)
 	{
-		PthreadWriteGuard(g_global_data->g_file_to_shadowzip_mutex);
-		std::map<int, FILE*>::iterator it_fd = g_global_data->g_fd_to_file.find(fd);
-		FILE* stream = (it_fd == g_global_data->g_fd_to_file.end()) ? NULL : it_fd->second;		
-		if (stream == NULL){return old_close(fd);}
-		g_global_data->g_fd_to_file.erase(it_fd);
-		
-		std::map<FILE*, ShadowZip*>::iterator it = g_global_data->g_file_to_shadowzip.find(stream);
-		shadow_zip = (it == g_global_data->g_file_to_shadowzip.end()) ? NULL : it->second;
-		if (it != g_global_data->g_file_to_shadowzip.end()){
-			g_global_data->g_file_to_shadowzip.erase(it);
-		}	
+		clean_mapping_data(file_extra_data);
+		return 0;
 	}
-	
-	if (shadow_zip == NULL){
-		return old_close(fd);
-	}else{
-		return shadow_zip->fclose((FILE*)(size_t)fd);
+	else
+	{
+		return close(fd);	
 	}
 }
 
@@ -932,7 +738,7 @@ static int init_hook(const std::string& bundle_id)
 	//dlclose(handle);
 	*/
 #define HOOK(lib, symbol) \
-	if(0 != xhook_register(lib, #symbol, (void*)my_##symbol, (void **)&old_##symbol)){ \
+	if(0 != xhook_register(lib, #symbol, (void*)my_##symbol, NULL)){ \
 		MY_ERROR("failed to find function:%s in %s", #symbol, lib); \
 		return -1; \
 	}
@@ -959,23 +765,6 @@ static int init_hook(const std::string& bundle_id)
 	}	
 	
 	return 0;
-}
-
-static DlopenType art_old_dlopen = NULL;
-static void *my_art_dlopen(const char *filename, int flags)
-{
-	MY_LOG("art redirect to %s", filename);
-	int il2cpp_postfix_len = strlen("libil2cpp.so");
-	int len = strlen(filename);
-	if (len > il2cpp_postfix_len && memcmp(filename + len - il2cpp_postfix_len, "libil2cpp.so", il2cpp_postfix_len) == 0)
-	{		
-		std::string bundle_id = get_bundle_id();	
-		char link_file[256] = {0};
-		snprintf(link_file, sizeof(link_file), "%s/libil2cpp.so", g_data_file_path);
-		MY_LOG("art redirect to %s", link_file);
-		return art_old_dlopen(link_file, flags);
-	}
-	return art_old_dlopen(filename, flags);
 }
 
 static int init_art_hook()
@@ -1010,46 +799,21 @@ static int init_art_hook()
 	return 0;
 }
 
-static void check_set_old_function_to_shadow_zip()
-{
-	if (NULL == ShadowZip::old_fopen){ShadowZip::old_fopen = old_fopen;}
-	if (NULL == ShadowZip::old_fseek){ShadowZip::old_fseek = old_fseek;}
-	if (NULL == ShadowZip::old_ftell){ShadowZip::old_ftell = old_ftell;}
-	if (NULL == ShadowZip::old_fread){ShadowZip::old_fread = old_fread;}
-	if (NULL == ShadowZip::old_fclose){ShadowZip::old_fclose = old_fclose;}
-	if (NULL == ShadowZip::old_fgets){ShadowZip::old_fgets = old_fgets;}
-}
 
 static void bootstrap()
 {
 	std::string bundle_id = get_bundle_id();
-	if (!verify_bundle_id( bundle_id.c_str() )){		
-		MY_ERROR("bundle id not matched:" BUNDLE_ID);
-		return;
-	}
 	
 	std::string default_il2cpp_path;
 	std::string patch_il2cpp_path;
 	bool use_patch = extract_patch_info(bundle_id, default_il2cpp_path, patch_il2cpp_path);
-	if (!verify_bundle_id( bundle_id.c_str() )){		
-		MY_ERROR("bootstrap running failed.");
-		return;
-	}
 	
 	if (use_patch){
-		MY_INFO("bootstrap running %s with apk_path:%s", TARGET_ARCH_ABI, g_apk_file_path);	
-		bool success = (0 == ShadowZip::init(g_use_data_path, g_apk_file_path)) && (0 == init_hook(bundle_id)) && (0 == init_art_hook());
+		MY_INFO("bootstrap running %s with apk_path:[%s], patch_so:[%s], patch_dir:[%s]", TARGET_ARCH_ABI, 
+			g_apk_file_path, patch_il2cpp_path.c_str(), g_use_data_path);	
+		bool success = (0 == ShadowZip::init(g_use_data_path, g_apk_file_path)) && (0 == init_hook(bundle_id)) && (0 == init_file_mapping_data());
 		if (success)
-		{			
-			static void *handle = dlopen(patch_il2cpp_path.c_str(), RTLD_NOW);
-			if (!handle) {
-				MY_ERROR("failed to load libil2cpp:%s, must exit", dlerror());
-				_exit(-1);
-				return;
-			}
-			
-			check_set_old_function_to_shadow_zip();
-			
+		{
 			MY_INFO("bootstrap running with patch:%s", patch_il2cpp_path.c_str());
 			//ShadowZip::output_apk(g_use_data_path);
 		}// else we still do so hook

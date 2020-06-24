@@ -5,27 +5,28 @@
 #include <sys/types.h>
 #include <dirent.h>
 #include <assert.h>
-#include <memory>
 #include <string.h>
 
 using namespace android;
 
 struct ShadowZipGlobalData
 {
+	PthreadRwMutex mutex;
     std::vector<FilePartitionInfo> patch_partitions_;
     std::vector<std::string> all_files_;
     uint64_t end_of_file_;
 };
 
-#define g_shadowzip_global_data (LeakSingleton<ShadowZipGlobalData, 0>::instance())
+class FileHandleReleaser
+{
+public:
+	FileHandleReleaser(FILE* fp){fp_ = fp;}
+	virtual ~FileHandleReleaser(){::fclose(fp_);}
+private:
+	FILE* fp_;	
+};
 
-FILE *(*volatile ShadowZip::old_fopen)(const char *path, const char *mode);
-int (*volatile ShadowZip::old_fseek)(FILE *stream, long offset, int whence);
-long (*volatile ShadowZip::old_ftell)(FILE *stream);
-//void (*volatile ShadowZip::old_rewind)(FILE *stream);
-size_t (*volatile ShadowZip::old_fread)(void *ptr, size_t size, size_t nmemb, FILE *stream);
-char* (*volatile ShadowZip::old_fgets)(char *s, int size, FILE *stream);
-int (*volatile ShadowZip::old_fclose)(FILE* _fp);
+#define g_shadowzip_global_data (LeakSingleton<ShadowZipGlobalData, 0>::instance())
 
 static void get_files(const char* _apk_patch_path, std::vector<std::string>& _files)
 {
@@ -58,7 +59,7 @@ static int parse_apk(const char* _path, std::vector<ZipEntry*>& _all_entries)
 		MY_ERROR("failure parse file %s", _path);
         return -1;
 	}
-	std::shared_ptr<FILE> autoDel(fp, [](FILE* fp){::fclose(fp);});
+	FileHandleReleaser autoDel(fp);
 	
     fseek(fp, 0, SEEK_END);
     fileLength = ftell(fp);
@@ -159,6 +160,16 @@ static int parse_apk(const char* _path, std::vector<ZipEntry*>& _all_entries)
             delete[] buf;
             return -1;
         }
+		
+		const char* filename = pEntry->getFileName();
+		int name_len = strlen(filename);
+		bool is_directory = name_len > 0 ? filename[name_len - 1] == '/' : true;
+		if (is_directory)
+		{
+			MY_METHOD("ignore directory:%s", filename);
+            delete pEntry;
+			continue;
+		}
 
         _all_entries.push_back(pEntry);
     }
@@ -200,11 +211,23 @@ static void add_entry_to_partition(ZipEntry* entry,
     int& pre_file_index,
     uint64_t& pre_file_stop,
     uint64_t& pre_shadow_stop,
-    std::vector<FilePartitionInfo>& patch_partitions)
+    std::vector<FilePartitionInfo>& patch_partitions, 
+	FILE* changed_entries_header_patch_file)
 {
     int file_index = entry->mUserData1;
     uint64_t file_start = entry->getEntryBegin();
-    bool can_merge = (file_index == pre_file_index) && ( file_start == pre_file_stop );
+	int padding = 0;
+	const char* filename = entry->getFileName();
+	int name_len = strlen(filename);
+	bool is_directory = name_len > 0 ? filename[name_len - 1] == '/' : true;
+	if (!entry->isCompressed() && !is_directory)
+	{
+		uint64_t shadow_zip_raw_file_offset = pre_shadow_stop + ZipEntry::LocalFileHeader::kLFHLen + entry->mLFH.mFileNameLength + entry->mLFH.mExtraFieldLength;
+		const uint alignment = 4; 
+		padding = (alignment - (shadow_zip_raw_file_offset % alignment)) % alignment;
+	}
+	
+    bool can_merge = (file_index == pre_file_index) && ( file_start == pre_file_stop ) && padding == 0;
 
     pre_file_index = file_index;
     pre_file_stop = entry->getEntryEnd();
@@ -215,13 +238,43 @@ static void add_entry_to_partition(ZipEntry* entry,
         FilePartitionInfo& partition = patch_partitions.back(); 
         partition.shadow_stop_ += entry_size;
         partition.stop_in_file_ += entry_size;
+		pre_shadow_stop += entry_size;
     }
+	else if (padding != 0){
+		uint64_t raw_file_offset = entry->getFileOffset();
+		if (entry->addPadding(padding) != 0){
+			MY_ERROR("entry add padding failed:%s", entry->getFileName());
+			exit(-1);	
+		}
+		
+		int header_file_start = ::ftell(changed_entries_header_patch_file);
+		if (entry->mLFH.write(changed_entries_header_patch_file) != 0)
+		{			
+			MY_ERROR("write entry local file header failed:%s", entry->getFileName());
+			exit(-1);
+		}
+		int header_file_stop = ::ftell(changed_entries_header_patch_file);
+		
+		//local header changed
+		{
+			FilePartitionInfo partition(pre_shadow_stop, pre_shadow_stop + header_file_stop - header_file_start, 1, header_file_start, header_file_stop); 
+			patch_partitions.push_back(partition);		
+			pre_shadow_stop += header_file_stop - header_file_start;
+		}
+		MY_METHOD("padding %d for %s, header size:%d, file begin:0x%08zx", padding, entry->getFileName(), header_file_stop - header_file_start, (size_t)pre_shadow_stop);
+		
+		{
+			FilePartitionInfo partition(pre_shadow_stop, pre_shadow_stop + pre_file_stop - raw_file_offset, file_index, raw_file_offset, pre_file_stop); 
+			patch_partitions.push_back(partition);
+			pre_shadow_stop += pre_file_stop - raw_file_offset;	
+		}
+	}
     else{
         FilePartitionInfo partition(pre_shadow_stop, pre_shadow_stop + entry_size, file_index, file_start, pre_file_stop); 
         patch_partitions.push_back(partition);
+		pre_shadow_stop += entry_size;
     }
     
-    pre_shadow_stop += entry_size;
 }
 
 void ShadowZip::output_apk(const char* _patch_dir)
@@ -231,7 +284,7 @@ void ShadowZip::output_apk(const char* _patch_dir)
 	
     char test_apk_path[512] = {0};
     snprintf( test_apk_path, sizeof(test_apk_path), "%s/test.apk", _patch_dir );
-    FILE* fw = old_fopen( test_apk_path, "wb" );
+    FILE* fw = ::fopen( test_apk_path, "wb" );
     char buffer[1024] = {0};
     while(1)
     {
@@ -244,25 +297,28 @@ void ShadowZip::output_apk(const char* _patch_dir)
             break;
         }
     }
-    MY_LOG("copy end at %ld, %llu", old_ftell(fw), (unsigned long long)g_shadowzip_global_data->end_of_file_);
+	{
+		MY_LOG("copy end at %ld, %llu", ::ftell(fw), (unsigned long long)test.end_of_file_);
+	}
     test.fclose(fr);
-    old_fclose(fw);
+    ::fclose(fw);
 }
 
 int ShadowZip::init(const char* _patch_dir, const char* _sys_apk_file)
 {
 	LeakSingleton<ShadowZipGlobalData, 0>::init();
-    old_fopen = NULL;
-    old_fseek = NULL;
-    old_ftell = NULL;
-    //old_rewind = NULL;
-    old_fread = NULL;
-	old_fgets = NULL;
-    old_fclose = NULL;
+	
+	PthreadWriteGuard(g_shadowzip_global_data->mutex);
     g_shadowzip_global_data->patch_partitions_.clear();
     g_shadowzip_global_data->all_files_.clear();
     g_shadowzip_global_data->all_files_.push_back(_sys_apk_file);
     g_shadowzip_global_data->end_of_file_ = 0;
+	
+	char changed_entries_header_path[512] = {0};
+    snprintf( changed_entries_header_path, sizeof(changed_entries_header_path), "%s/.entries_header.data", _patch_dir );
+    g_shadowzip_global_data->all_files_.push_back(changed_entries_header_path);
+    FILE* changed_entries_header_patch_file = ::fopen(changed_entries_header_path, "wb");
+	FileHandleReleaser autoDel(changed_entries_header_patch_file);  
 
     //find all patch files
     char apk_patch_path[512] = {0};
@@ -276,7 +332,7 @@ int ShadowZip::init(const char* _patch_dir, const char* _sys_apk_file)
     //find all entries in patches
     std::vector<std::vector<ZipEntry*> > entries_in_zip_file(g_shadowzip_global_data->all_files_.size());
     std::map<std::string, ZipEntry*> filename_2_entry;
-    for(int i = 1; i < g_shadowzip_global_data->all_files_.size(); i++) {
+    for(int i = 2; i < g_shadowzip_global_data->all_files_.size(); i++) {
         std::string& zip_path = g_shadowzip_global_data->all_files_[i];
         std::vector<ZipEntry*> zip_entries;
         int ret = parse_apk(zip_path.c_str(), zip_entries);
@@ -325,7 +381,7 @@ int ShadowZip::init(const char* _patch_dir, const char* _sys_apk_file)
         if (it != filename_2_entry.end()){ entry = it->second; }
         entry->mUserData2 = 1;
         uint64_t entry_new_start = pre_shadow_stop;
-        add_entry_to_partition(entry, pre_file_index, pre_file_stop, pre_shadow_stop, g_shadowzip_global_data->patch_partitions_);
+        add_entry_to_partition(entry, pre_file_index, pre_file_stop, pre_shadow_stop, g_shadowzip_global_data->patch_partitions_, changed_entries_header_patch_file);
         entry->setLFHOffset((off_t)entry_new_start);
         all_entries.push_back(entry);
     }
@@ -336,7 +392,7 @@ int ShadowZip::init(const char* _patch_dir, const char* _sys_apk_file)
             ZipEntry* entry = entries[j];
             if (entry->mUserData2 != 0) continue;
             uint64_t entry_new_start = pre_shadow_stop;
-            add_entry_to_partition(entry, pre_file_index, pre_file_stop, pre_shadow_stop, g_shadowzip_global_data->patch_partitions_);
+            add_entry_to_partition(entry, pre_file_index, pre_file_stop, pre_shadow_stop, g_shadowzip_global_data->patch_partitions_, changed_entries_header_patch_file);
             entry->setLFHOffset((off_t)entry_new_start);
             all_entries.push_back(entry);
         }
@@ -349,7 +405,8 @@ int ShadowZip::init(const char* _patch_dir, const char* _sys_apk_file)
     FILE* end_patch_file = ::fopen(end_patch_path, "wb");
     for(int i = 0; i < all_entries.size(); i++) {
         ZipEntry* entry = all_entries[i];
-		MY_LOG("%s, method:%d, LFHOffset:%08lx", entry->getFileName(), entry->mCDE.mCompressionMethod, entry->getLFHOffset());
+		MY_LOG("mapping [%08lx-%08lx-%08lx-%08lx] %s, method:%d, ", entry->getEntryBegin(), entry->getFileOffset(), entry->getFileOffset() + entry->getCompressedLen(), entry->getEntryEnd(), 
+			entry->getFileName(), entry->mCDE.mCompressionMethod);
         entry->mCDE.write(end_patch_file);
     }
     EndOfCentralDir end_of_cd;
@@ -383,143 +440,11 @@ int ShadowZip::init(const char* _patch_dir, const char* _sys_apk_file)
 
 uint64_t ShadowZip::get_eof_pos()
 {
+	PthreadWriteGuard(g_shadowzip_global_data->mutex);
 	MY_METHOD("get_eof_pos -> 0x%08llx", (unsigned long long)g_shadowzip_global_data->end_of_file_);
 	return g_shadowzip_global_data->end_of_file_;
 }
 
-FILE* ShadowZip::fopen()
-{
-    pos_ = 0;
-	fp_array_.clear();
-	for(int i = 0; i < g_shadowzip_global_data->all_files_.size(); i++)
-	{
-		fp_array_.push_back(NULL);
-	}
-    FILE* fp = prepare_file(0);
-	MY_METHOD("fopen -> 0x%08zx", (size_t)fp);
-	return fp;
-}
-
-off64_t ShadowZip::fseek(FILE *stream, off64_t offset, int whence)
-{	
-	MY_METHOD("fseek -> 0x%08zx at 0x%08llx with type %d", (size_t)stream, (unsigned long long)offset, whence);
-    int64_t cur_pos = pos_;
-    if (whence == SEEK_SET){
-        pos_ = offset;
-    }
-    else if (whence == SEEK_CUR){
-        pos_ += offset;
-    }
-    else if (whence == SEEK_END){
-        pos_ = g_shadowzip_global_data->end_of_file_ + offset;
-    }
-    if (pos_ < 0 || pos_ > g_shadowzip_global_data->end_of_file_){
-        pos_ = cur_pos;
-        return -1;
-    }
-    return 0;
-}
-
-long ShadowZip::ftell(FILE *stream)
-{
-	MY_METHOD("ftell -> 0x%08zx at 0x%08llx", (size_t)stream, (unsigned long long)pos_);
-    return (long) pos_;
-}
-
-void ShadowZip::rewind(FILE *stream)
-{
-    pos_ = 0;
-}
-
-size_t ShadowZip::fread(void *ptr, size_t size, size_t nmemb, FILE *stream)
-{
-	MY_METHOD("fread -> 0x%08zx at 0x%08llx, size:%zu, n:%zu", (size_t)stream, (unsigned long long)pos_, size, nmemb);
-	if (((int)nmemb) <= 0){return 0;}
-	
-    uint64_t begin = pos_;
-    uint64_t end = pos_ + size * nmemb;
-    size_t ret = 0;
-	
-    void* write_ptr = ptr;
-    for(int i = 0; i < g_shadowzip_global_data->patch_partitions_.size(); i++)
-    {
-        FilePartitionInfo& info = g_shadowzip_global_data->patch_partitions_[i];
-        if (begin >= info.shadow_stop_){
-            continue;
-        }
-        assert(begin >= info.shadow_start_);
-
-        uint64_t start_in_file = begin - info.shadow_start_ + info.start_in_file_;
-        uint64_t stop_in_file = (end >= info.shadow_stop_) ? info.stop_in_file_ : (end - info.shadow_start_ + info.start_in_file_);
-        int64_t read_size = stop_in_file - start_in_file;
-        if (read_size > nmemb){
-            MY_LOG("p:%d, start:[%zx,%zx) read size:%zu", i, (size_t)start_in_file, (size_t)stop_in_file,  (size_t)read_size);
-            MY_LOG("shadow:[%zx,%zx) pos:%zx", (size_t)begin, (size_t)end, (size_t)pos_);
-        }
-        FILE* fp = prepare_file(info.file_index_);
-        assert(fp != NULL);
-        old_fseek(fp, start_in_file, SEEK_SET);
-        old_fread(write_ptr, 1, read_size, fp); 
-        ret += read_size;
-        pos_ += read_size;
-        write_ptr = (char*)write_ptr + read_size;
-        begin += read_size;
-        if (begin >= end){return ret;}
-    }
-    return ret;
-
-}
-
-char* ShadowZip::fgets(char *s, int size, FILE *stream)
-{
-	MY_METHOD("fgets -> 0x%08zx at 0x%08llx, size:%d", (size_t)stream, (unsigned long long)pos_, size);
-    uint64_t begin = pos_;
-    uint64_t end = pos_ + size;
-
-    void* write_ptr = s;
-    for(int i = 0; i < g_shadowzip_global_data->patch_partitions_.size(); i++)
-    {
-        FilePartitionInfo& info = g_shadowzip_global_data->patch_partitions_[i];
-        if (begin >= info.shadow_stop_){
-            continue;
-        }
-        assert(begin >= info.shadow_start_);
-
-        uint64_t start_in_file = begin - info.shadow_start_ + info.start_in_file_;
-        uint64_t stop_in_file = (end >= info.shadow_stop_) ? info.stop_in_file_ : (end - info.shadow_start_ + info.start_in_file_);
-        int64_t read_size = stop_in_file - start_in_file;
-        if (read_size > size){
-            MY_LOG("p:%d, start:[%zx,%zx) read size:%zu", i, (size_t)start_in_file, (size_t)stop_in_file,  (size_t)read_size);
-            MY_LOG("shadow:[%zx,%zx) pos:%zx", (size_t)begin, (size_t)end, (size_t)pos_);
-        }
-        FILE* fp = prepare_file(info.file_index_);
-        assert(fp != NULL);
-        old_fseek(fp, start_in_file, SEEK_SET);
-        char* ret = old_fgets(s, size, fp); 
-		long pos_after_fgets = old_ftell(fp);
-		read_size = pos_after_fgets - start_in_file;
-        pos_ += read_size;
-        write_ptr = (char*)write_ptr + read_size;
-        begin += read_size;
-        return ret;
-    }
-    return NULL;
-}
-
-int ShadowZip::fclose(FILE* stream)
-{
-	MY_METHOD("fclose -> 0x%08zx at 0x%08llx", (size_t)stream, (unsigned long long)pos_);
-    for(int i = 0; i < fp_array_.size(); i++) 
-    {
-		FILE* fp = fp_array_[i];
-		if (fp) {		
-			MY_METHOD("fclose -> 0x%08zx fp%d at 0x%08lx", (size_t)stream, i, old_ftell(fp));
-			old_fclose(fp);
-		}
-    }
-    fp_array_.clear();
-    return 0;
-}
 
 bool ShadowZip::contains_path(const char* _apk_file, const char* _check_path)
 {
@@ -548,6 +473,148 @@ bool ShadowZip::contains_path(const char* _apk_file, const char* _check_path)
 	return ret;
 }
 
+ShadowZip::ShadowZip()
+{
+	PthreadWriteGuard(g_shadowzip_global_data->mutex);
+	patch_partitions_ = g_shadowzip_global_data->patch_partitions_;
+    all_files_ = g_shadowzip_global_data->all_files_;
+    end_of_file_ = g_shadowzip_global_data->end_of_file_;
+}
+
+FILE* ShadowZip::fopen()
+{
+    pos_ = 0;
+	fp_array_.clear();
+	for(int i = 0; i < all_files_.size(); i++)
+	{
+		fp_array_.push_back(NULL);
+	}
+    FILE* fp = prepare_file(0);
+	MY_METHOD("fopen -> 0x%08zx", (size_t)fp);
+	return fp;
+}
+
+off64_t ShadowZip::fseek(FILE *stream, off64_t offset, int whence)
+{	
+	MY_METHOD("fseek -> 0x%08zx at 0x%08llx with type %d", (size_t)stream, (unsigned long long)offset, whence);
+    int64_t cur_pos = pos_;
+    if (whence == SEEK_SET){
+        pos_ = offset;
+    }
+    else if (whence == SEEK_CUR){
+        pos_ += offset;
+    }
+    else if (whence == SEEK_END){
+        pos_ = end_of_file_ + offset;
+    }
+    if (pos_ < 0 || pos_ > end_of_file_){
+        pos_ = cur_pos;
+        return -1;
+    }
+    return 0;
+}
+
+long ShadowZip::ftell(FILE *stream)
+{
+	MY_METHOD("ftell -> 0x%08zx at 0x%08llx", (size_t)stream, (unsigned long long)pos_);
+    return (long) pos_;
+}
+
+void ShadowZip::rewind(FILE *stream)
+{
+    pos_ = 0;
+}
+
+size_t ShadowZip::fread(void *ptr, size_t size, size_t nmemb, FILE *stream)
+{
+	MY_METHOD("fread -> 0x%08zx at 0x%08llx, size:%zu, n:%zu", (size_t)stream, (unsigned long long)pos_, size, nmemb);
+	if (((int)nmemb) <= 0){return 0;}
+	
+    uint64_t begin = pos_;
+    uint64_t end = pos_ + size * nmemb;
+    size_t ret = 0;
+	
+    void* write_ptr = ptr;
+    for(int i = 0; i < patch_partitions_.size(); i++)
+    {
+        FilePartitionInfo& info = patch_partitions_[i];
+        if (begin >= info.shadow_stop_){
+            continue;
+        }
+        assert(begin >= info.shadow_start_);
+
+        uint64_t start_in_file = begin - info.shadow_start_ + info.start_in_file_;
+        uint64_t stop_in_file = (end >= info.shadow_stop_) ? info.stop_in_file_ : (end - info.shadow_start_ + info.start_in_file_);
+        int64_t read_size = stop_in_file - start_in_file;
+        if (read_size > nmemb){
+            MY_LOG("p:%d, start:[%zx,%zx) read size:%zu", i, (size_t)start_in_file, (size_t)stop_in_file,  (size_t)read_size);
+            MY_LOG("shadow:[%zx,%zx) pos:%zx", (size_t)begin, (size_t)end, (size_t)pos_);
+        }
+        FILE* fp = prepare_file(info.file_index_);
+        assert(fp != NULL);
+        ::fseek(fp, start_in_file, SEEK_SET);
+        ::fread(write_ptr, 1, read_size, fp); 
+        ret += read_size;
+        pos_ += read_size;
+        write_ptr = (char*)write_ptr + read_size;
+        begin += read_size;
+        if (begin >= end){return ret;}
+    }
+    return ret;
+
+}
+
+char* ShadowZip::fgets(char *s, int size, FILE *stream)
+{
+	MY_METHOD("fgets -> 0x%08zx at 0x%08llx, size:%d", (size_t)stream, (unsigned long long)pos_, size);
+    uint64_t begin = pos_;
+    uint64_t end = pos_ + size;
+
+    void* write_ptr = s;
+    for(int i = 0; i < patch_partitions_.size(); i++)
+    {
+        FilePartitionInfo& info = patch_partitions_[i];
+        if (begin >= info.shadow_stop_){
+            continue;
+        }
+        assert(begin >= info.shadow_start_);
+
+        uint64_t start_in_file = begin - info.shadow_start_ + info.start_in_file_;
+        uint64_t stop_in_file = (end >= info.shadow_stop_) ? info.stop_in_file_ : (end - info.shadow_start_ + info.start_in_file_);
+        int64_t read_size = stop_in_file - start_in_file;
+        if (read_size > size){
+            MY_LOG("p:%d, start:[%zx,%zx) read size:%zu", i, (size_t)start_in_file, (size_t)stop_in_file,  (size_t)read_size);
+            MY_LOG("shadow:[%zx,%zx) pos:%zx", (size_t)begin, (size_t)end, (size_t)pos_);
+        }
+        FILE* fp = prepare_file(info.file_index_);
+        assert(fp != NULL);
+        ::fseek(fp, start_in_file, SEEK_SET);
+        char* ret = ::fgets(s, size, fp); 
+		long pos_after_fgets = ::ftell(fp);
+		read_size = pos_after_fgets - start_in_file;
+        pos_ += read_size;
+        write_ptr = (char*)write_ptr + read_size;
+        begin += read_size;
+        return ret;
+    }
+    return NULL;
+}
+
+int ShadowZip::fclose(FILE* stream)
+{
+	MY_METHOD("fclose -> 0x%08zx at 0x%08llx", (size_t)stream, (unsigned long long)pos_);
+    for(int i = 0; i < fp_array_.size(); i++) 
+    {
+		FILE* fp = fp_array_[i];
+		if (fp) {		
+			MY_METHOD("fclose -> 0x%08zx fp%d at 0x%08lx", (size_t)stream, i, ::ftell(fp));
+			::fclose(fp);
+		}
+    }
+    fp_array_.clear();
+    return 0;
+}
+
 FILE* ShadowZip::prepare_file(int _file_index)
 {
     if (fp_array_[_file_index] != NULL ){
@@ -559,14 +626,14 @@ FILE* ShadowZip::prepare_file(int _file_index)
     {
 		FILE* fp = fp_array_[i];
 		if (fp) {		
-			MY_METHOD("fclose -> 0x%08zx fp:%d at 0x%08lx", (size_t)fp, i, old_ftell(fp));
-			old_fclose(fp);
+			MY_METHOD("fclose -> 0x%08zx fp:%d at 0x%08lx", (size_t)fp, i, ::ftell(fp));
+			::fclose(fp);
 			fp_array_[i] = NULL;
 		}
     }
 
-    std::string& path = g_shadowzip_global_data->all_files_[_file_index];
-    FILE* fp = old_fopen(path.c_str(), "rb");
+    std::string& path = all_files_[_file_index];
+    FILE* fp = ::fopen(path.c_str(), "rb");
     if (fp == NULL){
         MY_LOG("can't open file:%s", path.c_str());
         return NULL; 
